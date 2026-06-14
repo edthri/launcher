@@ -38,5 +38,4 @@ cargo test
 
 ## Remotes
 
-- `origin` — upstream `kayyagari/ballista`
-- `mine` — fork `pacmano1/launcher`
+- `origin` — `pacmano1/launcher` (this project's own repo; separated from upstream `kayyagari/ballista`)
