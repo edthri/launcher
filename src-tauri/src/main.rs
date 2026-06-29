@@ -136,7 +136,7 @@ async fn launch(id: String, on_progress: Channel<serde_json::Value>, app: AppHan
     // so a failed launch (e.g. java not found) doesn't pop an empty console.
     let console_window = console_sink
         .as_ref()
-        .map(|s| (s.label.clone(), format!("Console — {}", ce.name)));
+        .map(|s| (s.label.clone(), format!("Console - {}", ce.name)));
 
     let r = ws.run(ce, console_sink);
     if let Err(e) = r {

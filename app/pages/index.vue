@@ -199,6 +199,9 @@ const refreshStatuses = () => {
 const { theme, toggle: toggleTheme } = useTheme()
 
 const showAbout = ref(false)
+// Read the real version from the binary (CARGO_PKG_VERSION) so the About box
+// tracks the build instead of a hand-edited literal that goes stale.
+const appVersion = JSON.parse(await invoke<string>("get_launcher_info")).launcher_version
 
 const openHelp = async () => {
   const confirmed = await ask("This will open the Launcher wiki in your default browser. Continue?", {
@@ -462,7 +465,7 @@ const deselectAll = () => {
             </button>
           </div>
           <div class="space-y-3 text-sm">
-            <p class="text-text-secondary">Version 2.0.3</p>
+            <p class="text-text-secondary">Version {{ appVersion }}</p>
             <div class="space-y-1">
               <p class="text-text-secondary">Originally created by <span class="text-text-primary">Kiran Ayyagari</span></p>
               <p class="text-text-secondary">Modifications by <span class="text-text-primary">Diridium Technologies Inc.</span></p>
