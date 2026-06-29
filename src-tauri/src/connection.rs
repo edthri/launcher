@@ -12,7 +12,6 @@ use std::fs;
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -41,6 +40,10 @@ pub struct ConnectionEntry {
     pub show_console: bool,
     #[serde(default = "get_default_engine_type", rename = "engineType")]
     pub engine_type: String,
+    /// Trusted server leaf-cert SHA-256 (hex). None = not yet trusted; the first
+    /// launch prompts the operator (TOFU). Not a secret, so it lives in the JSON.
+    #[serde(default, rename = "pinnedCertSha256")]
+    pub pinned_cert_sha256: Option<String>,
 }
 
 pub struct ConnectionStore {
@@ -67,6 +70,7 @@ impl Default for ConnectionEntry {
             last_connected: None,
             show_console: false,
             engine_type: get_default_engine_type(),
+            pinned_cert_sha256: None,
         }
     }
 }
@@ -74,24 +78,39 @@ impl Default for ConnectionEntry {
 impl ConnectionStore {
     pub fn init(data_dir_path: PathBuf) -> Result<Self, Error> {
         let con_location = data_dir_path.join("launcher-data.json");
-        let mut con_location_file = File::open(&con_location);
-        if let Err(_e) = con_location_file {
-            con_location_file = File::create(&con_location);
-        }
-        let con_location_file = con_location_file?;
 
         let mut cache = HashMap::new();
-        let data: serde_json::Result<HashMap<String, ConnectionEntry>> =
-            serde_json::from_reader(con_location_file);
-        match data {
-            Ok(data) => {
-                for (id, ce) in data {
-                    cache.insert(id, Arc::new(ce));
+        // An empty or missing file is a normal first run. A non-empty file that
+        // won't parse is preserved (renamed aside) before we start empty, so a
+        // corrupt config never silently wipes the user's saved connections.
+        match fs::read_to_string(&con_location) {
+            Ok(contents) if contents.trim().is_empty() => {}
+            Ok(contents) => {
+                match serde_json::from_str::<HashMap<String, ConnectionEntry>>(&contents) {
+                    Ok(data) => {
+                        for (id, ce) in data {
+                            cache.insert(id, Arc::new(ce));
+                        }
+                    }
+                    Err(e) => {
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0);
+                        let backup = con_location
+                            .with_file_name(format!("launcher-data.corrupt-{}.json", ts));
+                        warn!(
+                            "could not parse {:?}: {}; backing it up to {:?} and starting empty",
+                            con_location, e, backup
+                        );
+                        if let Err(re) = fs::rename(&con_location, &backup) {
+                            warn!("failed to back up unparseable connection store: {}", re);
+                        }
+                    }
                 }
             }
-            Err(e) => {
-                info!("{}", e);
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::new(e)),
         }
 
         let cache_dir = data_dir_path.join("cache");
@@ -201,13 +220,23 @@ impl ConnectionStore {
     }
 
     fn write_connections_to_disk(&self) -> Result<(), Error> {
-        let c = self.con_cache.lock().expect("connection cache lock poisoned");
-        let val = serde_json::to_string_pretty(&*c)?;
-        let mut f = File::create(&self.con_location).map_err(|e| {
-            warn!("unable to open file for writing: {}", e);
-            Error::new(e)
-        })?;
-        f.write_all(val.as_bytes())?;
+        let val = {
+            let c = self.con_cache.lock().expect("connection cache lock poisoned");
+            serde_json::to_string_pretty(&*c)?
+        };
+        // Write to a sibling temp file, fsync, then atomically rename over the
+        // target so a crash mid-write can never leave a truncated (data-losing)
+        // launcher-data.json. The lock is released before this blocking I/O.
+        let tmp = self.con_location.with_file_name("launcher-data.json.tmp");
+        {
+            let mut f = File::create(&tmp).map_err(|e| {
+                warn!("unable to open file for writing: {}", e);
+                Error::new(e)
+            })?;
+            f.write_all(val.as_bytes())?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &self.con_location)?;
         Ok(())
     }
 
@@ -221,6 +250,19 @@ impl ConnectionStore {
                     .expect("system clock is before UNIX epoch")
                     .as_millis() as i64,
             );
+            cache.insert(id.to_string(), Arc::new(updated));
+        }
+        drop(cache);
+        self.write_connections_to_disk()?;
+        Ok(())
+    }
+
+    /// Set (or clear) a connection's pinned certificate fingerprint.
+    pub fn update_pin(&self, id: &str, sha256: Option<String>) -> Result<(), Error> {
+        let mut cache = self.con_cache.lock().expect("connection cache lock poisoned");
+        if let Some(entry) = cache.get(id) {
+            let mut updated = (**entry).clone();
+            updated.pinned_cert_sha256 = sha256;
             cache.insert(id.to_string(), Arc::new(updated));
         }
         drop(cache);
@@ -251,62 +293,19 @@ impl ConnectionStore {
     }
 }
 
+/// Default `java_home` for a new connection. Use JAVA_HOME if set, otherwise
+/// leave it empty so the launch falls back to `java` on PATH. We deliberately do
+/// not guess a JDK per platform: the old guesses were wrong (macOS pinned Java
+/// 8, Windows picked up the System32 stub) and the standard mechanisms are more
+/// reliable. The user can still set java_home per connection in the editor.
 pub fn find_java_home() -> String {
-    let mut java_home = String::new();
-    if let Some(jh) = OS_ENV.var_os("JAVA_HOME") {
-        if let Some(jh_str) = jh.to_str() {
-            java_home = String::from(jh_str);
-            info!("JAVA_HOME is set to {}", java_home);
-        } else {
-            warn!("JAVA_HOME contains non-UTF-8 characters, ignoring");
+    match OS_ENV.var_os("JAVA_HOME").and_then(|jh| jh.to_str().map(String::from)) {
+        Some(jh) => {
+            info!("JAVA_HOME is set to {}", jh);
+            jh
         }
+        None => String::new(),
     }
-
-    #[cfg(target_os = "macos")]
-    if java_home.is_empty() {
-        let out = Command::new("/usr/libexec/java_home")
-            .args(["-v", "1.8"])
-            .output();
-        if let Ok(out) = out {
-            if out.status.success() {
-                match String::from_utf8(out.stdout) {
-                    Ok(jh) => {
-                        info!("/usr/libexec/java_home -v 1.8 returned {}", jh);
-                        java_home = jh.trim().to_string();
-                    }
-                    Err(e) => {
-                        warn!("java_home output was not valid UTF-8: {}", e);
-                    }
-                }
-            }
-        }
-    }
-
-    #[cfg(windows)]
-    if java_home.is_empty() {
-        let out = Command::new("where")
-            .arg("java")
-            .output();
-        if let Ok(out) = out {
-            if out.status.success() {
-                if let Ok(paths) = String::from_utf8(out.stdout) {
-                    if let Some(first) = paths.lines().next() {
-                        let java_path = PathBuf::from(first.trim());
-                        if let Some(bin_dir) = java_path.parent() {
-                            if let Some(home_dir) = bin_dir.parent() {
-                                if let Some(home_str) = home_dir.to_str() {
-                                    info!("derived JAVA_HOME from PATH: {}", home_str);
-                                    java_home = home_str.to_string();
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    java_home
 }
 
 fn get_default_group() -> String {

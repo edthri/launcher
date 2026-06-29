@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { Connection } from "~/types"
+import type { Connection, CertInfo } from "~/types"
 import { LandingScreenServerStatus } from "~/enums"
 import { Channel, invoke } from "@tauri-apps/api/core"
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http"
@@ -74,9 +74,17 @@ const sortedServers = computed(() => {
 
 const isGrouped = computed(() => sortBy.value === "group")
 
-const mappedServers = computed(() =>
-  Object.groupBy(filteredServers.value, ({ group }) => group),
-)
+// Manual group instead of Object.groupBy, which isn't available on older
+// WebKitGTK / WebView2 and would crash the grouped view there. Null prototype
+// keeps the same semantics (no collisions with Object.prototype keys).
+const mappedServers = computed<Record<string, Connection[]>>(() => {
+  const groups: Record<string, Connection[]> = Object.create(null)
+  for (const server of filteredServers.value) {
+    if (!groups[server.group]) groups[server.group] = []
+    groups[server.group].push(server)
+  }
+  return groups
+})
 
 const collapsedGroups = reactive<Set<string>>(
   new Set(JSON.parse(localStorage.getItem("launcher-collapsed-groups") || "[]")),
@@ -95,11 +103,15 @@ const hasServers = computed(() => servers.length > 0)
 const hasResults = computed(() => filteredServers.value.length > 0)
 
 const handleLaunchClick = (connection: Connection) => {
+  // Guard against double-click / rapid relaunch stacking trust modals + processes.
+  if (isLoading.value) return
   isLoading.value = true
   launchError.value = null
   progressMessage.value = "Connecting..."
   nextTick(() => launchServer(connection))
 }
+
+const { trustCertificate, confirmCertChange } = useConfirmRejectModal()
 
 const launchServer = async (connection: Connection) => {
   const onProgress = new Channel<{ message: string }>()
@@ -108,10 +120,38 @@ const launchServer = async (connection: Connection) => {
   }
 
   try {
-    await invoke("launch", {
-      id: connection.id,
-      on_progress: onProgress,
-    })
+    // Loop so a certificate trust prompt can be shown, then the launch retried.
+    // code 0 = launched, 2 = first-use trust, 3 = cert changed, else = error.
+    // Bounded so a cert that changes every handshake can't re-prompt forever.
+    let attempts = 0
+    while (true) {
+      if (attempts++ > 4) {
+        launchError.value = "Launch aborted: the server certificate keeps changing."
+        return
+      }
+      const resp = JSON.parse(
+        await invoke<string>("launch", { id: connection.id, on_progress: onProgress }),
+      )
+      if (resp.code === 0) return
+      if (resp.code === 2 || resp.code === 3) {
+        progressMessage.value = "Awaiting certificate approval..."
+        const cert = resp.cert as CertInfo
+        const approved =
+          resp.code === 2
+            ? await trustCertificate(cert)
+            : await confirmCertChange(cert, connection.pinnedCertSha256 ?? "")
+        if (!approved) {
+          launchError.value = "Launch cancelled: certificate not trusted."
+          return
+        }
+        await invoke("set_pin", { connection_id: connection.id, sha256: cert.sha256 })
+        connection.pinnedCertSha256 = cert.sha256
+        progressMessage.value = "Connecting..."
+        continue
+      }
+      launchError.value = resp.msg || `Launch failed (code ${resp.code})`
+      return
+    }
   } catch (e) {
     launchError.value = `Launch failed: ${e}`
   } finally {
@@ -198,18 +238,24 @@ const deselectAll = () => {
       </div>
       <div class="flex items-center gap-2">
         <button
+          type="button"
+          :aria-label="theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'"
           @click="toggleTheme"
           class="flex items-center justify-center size-6 rounded-md text-text-disabled hover:text-text-tertiary hover:cursor-pointer transition-colors duration-100"
         >
           <icon :name="theme === 'dark' ? 'ph:sun' : 'ph:moon'" class="text-sm" />
         </button>
         <button
+          type="button"
+          aria-label="Help"
           @click="openHelp"
           class="flex items-center justify-center size-6 rounded-md text-text-disabled hover:text-text-tertiary hover:cursor-pointer transition-colors duration-100"
         >
           <icon name="ph:question" class="text-sm" />
         </button>
         <button
+          type="button"
+          aria-label="About"
           @click="showAbout = true"
           class="flex items-center justify-center size-6 rounded-md text-text-disabled hover:text-text-tertiary hover:cursor-pointer transition-colors duration-100"
         >
